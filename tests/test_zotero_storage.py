@@ -29,7 +29,9 @@ class TestZoteroOCRStorage:
 
             storage = ZoteroOCRStorage()
             assert storage.library_id == "12345"
-            mock_zotero.assert_called_once()
+            # Two Zotero clients are created: read client and write client
+            # (local API is read-only, so writes need web API)
+            assert mock_zotero.call_count == 2
 
     def test_init_missing_credentials(self) -> None:
         """Test that missing credentials raise ValueError."""

@@ -41,6 +41,15 @@ class ConversionResult:
     error: str | None = None
     """Error message if conversion failed but fallback succeeded."""
 
+    images: dict[str, bytes] = field(default_factory=dict)
+    """Extracted images as {filename: bytes} mapping."""
+
+    tables: dict[str, str] = field(default_factory=dict)
+    """Extracted tables as {id: content} mapping."""
+
+    pages_processed: int = 0
+    """Number of pages processed."""
+
 
 @dataclass
 class OCRCache:
@@ -260,6 +269,9 @@ def convert_to_markdown_enhanced(
                 source="cache",
                 images_dir=cache._get_cache_path(cache._get_cache_key(file_path)) / "images",
                 cached=True,
+                images=cached_result.images,
+                tables=cached_result.tables,
+                pages_processed=cached_result.pages_processed,
             )
 
     # Try Mistral OCR
@@ -282,6 +294,9 @@ def convert_to_markdown_enhanced(
             source="mistral_ocr",
             images_dir=images_dir if result.images else None,
             cached=False,
+            images=result.images,
+            tables=result.tables,
+            pages_processed=result.pages_processed,
         )
 
     except Exception as e:

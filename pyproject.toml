@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mistral-ocr-zotero"
-version = "0.1.0"
+version = "0.1.4"
 description = "Integrate Mistral OCR API with Zotero-MCP for enhanced PDF-to-markdown conversion"
 readme = "README.md"
 requires-python = ">=3.11"

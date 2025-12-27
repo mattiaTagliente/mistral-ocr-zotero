@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +23,12 @@ from pyzotero import zotero
 from mistral_ocr_zotero.ocr_client import OCRResult
 
 logger = logging.getLogger(__name__)
+# Add file handler for debugging
+_fh = logging.FileHandler(str(Path.home() / "mistral_ocr_debug.log"))
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(_fh)
+logger.setLevel(logging.DEBUG)
 
 # Marker used to identify OCR-converted attachments
 OCR_ATTACHMENT_MARKER = "[Mistral-OCR]"
@@ -53,27 +60,38 @@ class ZoteroOCRStorage:
             self.local = True
 
         # Load from environment if not provided
+        env_library_id = os.environ.get("ZOTERO_LIBRARY_ID")
         if self.library_id is None:
-            self.library_id = os.environ.get("ZOTERO_LIBRARY_ID", "0" if self.local else None)
+            self.library_id = env_library_id
         if self.api_key is None:
             self.api_key = os.environ.get("ZOTERO_API_KEY")
 
-        if not self.library_id or not self.api_key:
+        # Determine library IDs for read and write clients
+        # Read client: Local API accepts "0" as shorthand for current user
+        # Write client: Web API REQUIRES the actual library ID (never "0")
+        read_library_id = self.library_id or ("0" if self.local else None)
+        write_library_id = self.library_id  # Must be real ID, not "0"
+
+        logger.debug(f"ZoteroOCRStorage init: local={self.local}, library_id={self.library_id}, "
+                     f"read_id={read_library_id}, write_id={write_library_id}")
+
+        if not write_library_id or not self.api_key:
             raise ValueError(
-                "ZOTERO_LIBRARY_ID and ZOTERO_API_KEY must be provided or set in environment"
+                "ZOTERO_LIBRARY_ID and ZOTERO_API_KEY must be provided or set in environment. "
+                f"Got library_id={self.library_id}, api_key={'set' if self.api_key else 'not set'}"
             )
 
         # Read client - uses local API if available for faster PDF access
         self._zotero = zotero.Zotero(
-            self.library_id or "0",
+            read_library_id,
             self.library_type,
             self.api_key,
             local=self.local
         )
 
-        # Write client - always uses web API (local API is read-only)
+        # Write client - always uses web API with real library ID (local API is read-only)
         self._zotero_write = zotero.Zotero(
-            self.library_id,
+            write_library_id,
             self.library_type,
             self.api_key,
             local=False  # Always use web API for writes
@@ -134,17 +152,155 @@ class ZoteroOCRStorage:
         """
         Check if an item already has an OCR conversion.
 
+        Checks both local storage and Zotero attachment.
+
         Args:
             item_key: Zotero item key.
 
         Returns:
-            True if OCR conversion exists.
+            True if OCR conversion exists (locally or in Zotero).
         """
+        # Check local storage first (faster, no API call)
+        item_dir = self.get_item_storage_dir(item_key)
+        if item_dir.exists():
+            md_files = list(item_dir.glob("*_ocr.md"))
+            if md_files:
+                return True
+        # Fall back to checking Zotero attachment
         return self.get_ocr_attachment(item_key) is not None
 
     def get_item_storage_dir(self, item_key: str) -> Path:
         """Get the local storage directory for an item's OCR results."""
         return self.storage_dir / item_key
+
+    def create_attachment_only(
+        self,
+        item_key: str,
+        pdf_filename: str | None = None,
+        max_retries: int = 3,
+    ) -> dict[str, Any]:
+        """
+        Create Zotero attachment for existing local OCR file without rewriting it.
+
+        Use this when local storage exists but Zotero attachment is missing,
+        to avoid header stacking and unnecessary file I/O.
+
+        Args:
+            item_key: Parent Zotero item key.
+            pdf_filename: Original PDF filename for attachment title.
+            max_retries: Maximum number of retry attempts for API failures.
+
+        Returns:
+            Created attachment data or error dict.
+        """
+        # Find existing local file
+        item_dir = self.get_item_storage_dir(item_key)
+        if not item_dir.exists():
+            logger.error(f"No local storage found for {item_key} at {item_dir}")
+            return {"error": f"No local storage found for {item_key}"}
+
+        md_files = list(item_dir.glob("*_ocr.md"))
+        if not md_files:
+            logger.error(f"No OCR markdown file found in {item_dir}")
+            return {"error": f"No OCR markdown file found in {item_dir}"}
+
+        md_path = md_files[0]  # Use first match
+        logger.info(f"Found local OCR file: {md_path}")
+
+        # Double-check for existing attachment to handle race conditions
+        # (another request might have created it while we were processing)
+        if self.has_ocr_attachment(item_key):
+            logger.info(f"Attachment already exists for {item_key} (race condition avoided)")
+            return {
+                "key": "existing",
+                "type": "linked_file",
+                "local_path": str(md_path),
+                "note": "Attachment already existed (race condition)",
+            }
+
+        # Generate attachment title - use filename stem or item key as fallback
+        if pdf_filename and pdf_filename.strip():
+            base_name = Path(pdf_filename).stem
+        else:
+            # Fallback: try to extract from local file name
+            base_name = md_path.stem.replace("_ocr", "") or item_key
+            logger.warning(f"No pdf_filename provided, using fallback: {base_name}")
+        attachment_title = f"{OCR_ATTACHMENT_MARKER} {base_name}"
+
+        # Create the linked file attachment via web API
+        attachment_data = {
+            "itemType": "attachment",
+            "parentItem": item_key,
+            "linkMode": "linked_file",
+            "title": attachment_title,
+            "path": str(md_path.absolute()),
+            "contentType": "text/markdown",
+            "tags": [{"tag": "mistral-ocr"}, {"tag": "ocr-converted"}],
+        }
+
+        logger.debug(f"Attachment data: {attachment_data}")
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Check again for race condition before each attempt
+                if attempt > 0 and self.has_ocr_attachment(item_key):
+                    logger.info(f"Attachment created by concurrent request for {item_key}")
+                    return {
+                        "key": "existing",
+                        "type": "linked_file",
+                        "local_path": str(md_path),
+                        "note": "Attachment created by concurrent request",
+                    }
+
+                response = self.zot_write.create_items([attachment_data])
+                logger.info(f"Zotero API response (attempt {attempt + 1}): {response}")
+
+                # Handle various response formats from Zotero API
+                if response.get("success"):
+                    attachment_key = list(response["success"].values())[0]
+                    logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
+                    return {
+                        "key": attachment_key,
+                        "type": "linked_file",
+                        "local_path": str(md_path),
+                    }
+                elif response.get("successful"):
+                    # Alternative response format
+                    first_key = list(response["successful"].keys())[0]
+                    attachment_key = response["successful"][first_key].get("key")
+                    if attachment_key:
+                        logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
+                        return {
+                            "key": attachment_key,
+                            "type": "linked_file",
+                            "local_path": str(md_path),
+                        }
+
+                # Check for failure details
+                failed = response.get("failed", {}) or response.get("failure", {})
+                if failed:
+                    error_details = str(failed)
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {error_details}")
+                    last_error = error_details
+                else:
+                    # Unknown response format
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} - unexpected response: {response}")
+                    last_error = str(response)
+
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} exception: {e}")
+                last_error = str(e)
+
+            # Wait before retry with exponential backoff
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s
+                logger.info(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+        # All retries exhausted
+        logger.error(f"Failed to create linked attachment after {max_retries} attempts: {last_error}")
+        return {"error": f"Failed after {max_retries} attempts: {last_error}", "local_path": str(md_path)}
 
     def store_ocr_result(
         self,
@@ -172,7 +328,26 @@ class ZoteroOCRStorage:
         md_filename = f"{base_name}_ocr.md"
         md_path = item_dir / md_filename
 
-        # Add metadata header to markdown
+        # Update image paths to use images/ subdirectory
+        markdown_content = result.markdown
+
+        # Robust protection against header stacking: strip ALL existing OCR headers
+        # Use regex to find and remove all Mistral OCR Conversion comment blocks
+        header_pattern = re.compile(
+            r'^<!--\s*\n?Mistral OCR Conversion\s*\n'
+            r'(?:Source:.*?\n)?'
+            r'(?:Pages:.*?\n)?'
+            r'(?:Converted:.*?\n)?'
+            r'-->\s*\n*',
+            re.MULTILINE
+        )
+        original_len = len(markdown_content)
+        markdown_content = header_pattern.sub('', markdown_content)
+        if len(markdown_content) < original_len:
+            headers_removed = (original_len - len(markdown_content)) // 100  # Rough estimate
+            logger.info(f"Stripped existing OCR headers to prevent stacking (removed ~{headers_removed} headers)")
+
+        # Add fresh metadata header to markdown
         header = f"""<!--
 Mistral OCR Conversion
 Source: {result.source_file or 'Unknown'}
@@ -181,8 +356,6 @@ Converted: {datetime.now().isoformat()}
 -->
 
 """
-        # Update image paths to use images/ subdirectory
-        markdown_content = result.markdown
         if result.images:
             # Update image references: ![...](img-N.jpeg) -> ![...](images/img-N.jpeg)
             markdown_content = re.sub(r'\]\((img-\d+\.[a-z]+)\)', r'](images/\1)', markdown_content)
@@ -230,6 +403,7 @@ Converted: {datetime.now().isoformat()}
 
         # For local Zotero, create a linked file attachment pointing to the markdown
         if self.local:
+            logger.info(f"store_ocr_result: calling _create_linked_attachment for {item_key}, local={self.local}")
             return self._create_linked_attachment(item_key, md_path, attachment_title, result)
         else:
             # For web API, create a note with the content
@@ -241,8 +415,10 @@ Converted: {datetime.now().isoformat()}
         md_path: Path,
         title: str,
         result: OCRResult,
+        max_retries: int = 3,
     ) -> dict[str, Any]:
-        """Create a linked file attachment in Zotero via web API."""
+        """Create a linked file attachment in Zotero via web API with retry logic."""
+        logger.info(f"_create_linked_attachment called: item={item_key}, title={title}, path={md_path}")
         # Use web API to create linked file attachment (local API is read-only)
         attachment_data = {
             "itemType": "attachment",
@@ -254,33 +430,70 @@ Converted: {datetime.now().isoformat()}
             "tags": [{"tag": "mistral-ocr"}, {"tag": "ocr-converted"}],
         }
 
-        try:
-            response = self.zot_write.create_items([attachment_data])
-            if response.get("success"):
-                attachment_key = list(response["success"].values())[0]
-                logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
-                return {
-                    "key": attachment_key,
-                    "type": "linked_file",
-                    "local_path": str(md_path),
-                    "images_count": len(result.images),
-                }
-            elif response.get("successful"):
-                # Local API returns different format
-                attachment_key = response["successful"]["0"]["key"]
-                logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
-                return {
-                    "key": attachment_key,
-                    "type": "linked_file",
-                    "local_path": str(md_path),
-                    "images_count": len(result.images),
-                }
-            else:
-                logger.error(f"Failed to create linked attachment: {response}")
-                return {"error": str(response), "local_path": str(md_path)}
-        except Exception as e:
-            logger.error(f"Error creating linked attachment: {e}")
-            return {"error": str(e), "local_path": str(md_path)}
+        logger.debug(f"Creating linked attachment: {attachment_data}")
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Check for race condition before each retry
+                if attempt > 0 and self.has_ocr_attachment(item_key):
+                    logger.info(f"Attachment created by concurrent request for {item_key}")
+                    return {
+                        "key": "existing",
+                        "type": "linked_file",
+                        "local_path": str(md_path),
+                        "images_count": len(result.images),
+                        "note": "Attachment created by concurrent request",
+                    }
+
+                response = self.zot_write.create_items([attachment_data])
+                logger.info(f"Zotero API response (attempt {attempt + 1}): {response}")
+
+                if response.get("success"):
+                    attachment_key = list(response["success"].values())[0]
+                    logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
+                    return {
+                        "key": attachment_key,
+                        "type": "linked_file",
+                        "local_path": str(md_path),
+                        "images_count": len(result.images),
+                    }
+                elif response.get("successful"):
+                    # Alternative response format
+                    first_key = list(response["successful"].keys())[0]
+                    attachment_key = response["successful"][first_key].get("key")
+                    if attachment_key:
+                        logger.info(f"Created linked OCR attachment: {attachment_key} -> {md_path}")
+                        return {
+                            "key": attachment_key,
+                            "type": "linked_file",
+                            "local_path": str(md_path),
+                            "images_count": len(result.images),
+                        }
+
+                # Check for failure details
+                failed = response.get("failed", {}) or response.get("failure", {})
+                if failed:
+                    error_details = str(failed)
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {error_details}")
+                    last_error = error_details
+                else:
+                    logger.warning(f"Attempt {attempt + 1}/{max_retries} - unexpected response: {response}")
+                    last_error = str(response)
+
+            except Exception as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} exception: {e}")
+                last_error = str(e)
+
+            # Wait before retry with exponential backoff
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.info(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+
+        # All retries exhausted
+        logger.error(f"Failed to create linked attachment after {max_retries} attempts: {last_error}")
+        return {"error": f"Failed after {max_retries} attempts: {last_error}", "local_path": str(md_path)}
 
     def _create_note_attachment(
         self,
