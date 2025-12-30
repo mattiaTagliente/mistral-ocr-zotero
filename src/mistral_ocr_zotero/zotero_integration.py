@@ -165,7 +165,39 @@ class ZoteroOCRIntegration:
             return None
 
         attachment_key = pdf_attachment.get("key")
-        filename = pdf_attachment.get("data", {}).get("filename", "document.pdf")
+        
+        # Try to get a meaningful filename from multiple sources
+        data = pdf_attachment.get("data", {})
+        filename = data.get("filename") or data.get("title")
+        
+        # Debug logging for filename detection
+        logger.debug(f"PDF attachment data keys: {list(data.keys())}")
+        logger.debug(f"PDF attachment filename from data: {data.get('filename')}")
+        logger.debug(f"PDF attachment title from data: {data.get('title')}")
+        
+        # If still no filename, try to get parent item info for a meaningful name
+        if not filename or filename == "document.pdf":
+            try:
+                parent_item = self.zot.item(item_key)
+                parent_data = parent_item.get("data", {})
+                # Use citation key if available, otherwise title
+                citation_key = parent_data.get("citationKey")
+                title = parent_data.get("title", "")
+                
+                if citation_key:
+                    filename = f"{citation_key}.pdf"
+                    logger.info(f"Using citation key for filename: {filename}")
+                elif title:
+                    # Clean title for use as filename
+                    import re
+                    clean_title = re.sub(r'[<>:"/\\|?*]', '', title)[:80]
+                    filename = f"{clean_title}.pdf"
+                    logger.info(f"Using cleaned title for filename: {filename}")
+                else:
+                    filename = "document.pdf"
+            except Exception as e:
+                logger.warning(f"Could not get parent item for filename: {e}")
+                filename = "document.pdf"
 
         logger.info(f"Processing PDF {filename} for item {item_key}")
 
