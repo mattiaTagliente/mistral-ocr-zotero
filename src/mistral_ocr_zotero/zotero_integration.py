@@ -101,6 +101,46 @@ class ZoteroOCRIntegration:
             raise RuntimeError("Storage not initialized")
         return self._storage
 
+    def _process_pdf_file(
+        self,
+        pdf_path: Path,
+        item_key: str,
+        store_in_zotero: bool = True,
+        original_filename: str | None = None,
+    ) -> OCRResult | None:
+        """
+        Process a PDF file through Mistral OCR.
+
+        Args:
+            pdf_path: Path to the PDF file.
+            item_key: Zotero item key for storage.
+            store_in_zotero: Whether to store the result in Zotero.
+            original_filename: Original filename for storage reference.
+
+        Returns:
+            OCRResult if successful, None otherwise.
+        """
+        if self.ocr is None:
+            logger.error("OCR client not initialized")
+            return None
+
+        try:
+            result = self.ocr.process_pdf_from_path(pdf_path)
+            logger.info(
+                f"OCR complete: {result.pages_processed} pages, "
+                f"{len(result.images)} images extracted"
+            )
+        except Exception as e:
+            logger.error(f"OCR processing failed: {e}")
+            return None
+
+        # Store result
+        if store_in_zotero:
+            filename = original_filename or pdf_path.name
+            self.storage.store_ocr_result(item_key, result, filename)
+
+        return result
+
     def has_ocr_conversion(self, item_key: str) -> bool:
         """
         Check if an item already has an OCR-converted markdown.
@@ -201,7 +241,28 @@ class ZoteroOCRIntegration:
 
         logger.info(f"Processing PDF {filename} for item {item_key}")
 
-        # Download PDF to temporary location
+        # Check if this is a linked file (path stored locally) vs imported file
+        link_mode = data.get("linkMode", "")
+        local_path = data.get("path", "")
+        
+        # For linked files, read directly from disk
+        if link_mode == "linked_file" and local_path:
+            # Clean up the path (Zotero stores it with possible prefix)
+            if local_path.startswith("attachments:"):
+                # Relative to Zotero attachments base dir - need to resolve
+                logger.warning(f"Relative attachment path not supported: {local_path}")
+                local_path = ""
+            
+            if local_path:
+                pdf_source_path = Path(local_path)
+                if pdf_source_path.exists():
+                    logger.info(f"Using linked file directly: {pdf_source_path}")
+                    return self._process_pdf_file(pdf_source_path, item_key, store_in_zotero, filename)
+                else:
+                    logger.error(f"Linked file not found: {pdf_source_path}")
+                    return None
+
+        # For imported files or if linked file path didn't work, use dump()
         with tempfile.TemporaryDirectory() as tmpdir:
             pdf_path = Path(tmpdir) / filename
             try:
@@ -214,26 +275,7 @@ class ZoteroOCRIntegration:
                 logger.error(f"PDF download failed, file not found: {pdf_path}")
                 return None
 
-            # Process with Mistral OCR
-            if self.ocr is None:
-                logger.error("OCR client not initialized")
-                return None
-
-            try:
-                result = self.ocr.process_pdf_from_path(pdf_path)
-                logger.info(
-                    f"OCR complete: {result.pages_processed} pages, "
-                    f"{len(result.images)} images extracted"
-                )
-            except Exception as e:
-                logger.error(f"OCR processing failed: {e}")
-                return None
-
-            # Store result
-            if store_in_zotero:
-                self.storage.store_ocr_result(item_key, result, filename)
-
-            return result
+            return self._process_pdf_file(pdf_path, item_key, store_in_zotero, filename)
 
     def get_fulltext_with_ocr(
         self,
