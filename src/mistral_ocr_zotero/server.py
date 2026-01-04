@@ -104,11 +104,14 @@ class HealthResponse(BaseModel):
     version: str
 
 
+# Server version (should match the Zotero plugin version)
+SERVER_VERSION = "0.3.0"
+
 # Create FastAPI app
 app = FastAPI(
     title="Mistral OCR Server",
     description="HTTP server for Zotero Mistral OCR processing",
-    version="0.1.0",
+    version=SERVER_VERSION,
 )
 
 # Add CORS middleware for Zotero plugin access
@@ -186,7 +189,7 @@ async def process_items_background(job_id: str, item_keys: list[str], force: boo
 @app.get("/health", response_model=HealthResponse)
 async def health_check() -> HealthResponse:
     """Health check endpoint."""
-    return HealthResponse(status="ok", version="0.1.0")
+    return HealthResponse(status="ok", version=SERVER_VERSION)
 
 
 @app.post("/ocr", response_model=OCRResponse)
