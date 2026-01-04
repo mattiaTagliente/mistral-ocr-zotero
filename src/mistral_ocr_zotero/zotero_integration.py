@@ -24,6 +24,17 @@ from mistral_ocr_zotero.zotero_storage import ZoteroOCRStorage, OCR_ATTACHMENT_M
 logger = logging.getLogger(__name__)
 
 
+class FileNotAccessibleError(Exception):
+    """
+    Raised when a file exists but is not accessible.
+    
+    This commonly occurs with cloud sync services (OneDrive, Dropbox, etc.)
+    where files appear to exist locally but are actually cloud-only placeholders
+    that haven't been synced.
+    """
+    pass
+
+
 @dataclass
 class ZoteroOCRIntegration:
     """
@@ -141,6 +152,58 @@ class ZoteroOCRIntegration:
 
         return result
 
+    def _is_file_accessible(self, file_path: Path, timeout_seconds: float = 5.0) -> bool:
+        """
+        Check if a file is actually accessible (not a cloud-only placeholder).
+
+        On Windows with OneDrive/cloud sync, files can appear to exist (Path.exists()
+        returns True) but are actually cloud-only placeholders. Attempting to read
+        these files will either hang (waiting for sync) or fail.
+
+        This method attempts to read a small portion of the file with a timeout
+        to verify it's truly accessible.
+
+        Args:
+            file_path: Path to the file to check.
+            timeout_seconds: Maximum time to wait for file access.
+
+        Returns:
+            True if the file is accessible, False otherwise.
+        """
+        import threading
+        import time
+
+        result = {"accessible": False, "error": None}
+
+        def try_read():
+            try:
+                with open(file_path, "rb") as f:
+                    # Try to read just the first few bytes
+                    _ = f.read(1024)
+                result["accessible"] = True
+            except Exception as e:
+                result["error"] = str(e)
+
+        # Run file read in a separate thread with timeout
+        read_thread = threading.Thread(target=try_read)
+        read_thread.daemon = True
+        read_thread.start()
+        read_thread.join(timeout=timeout_seconds)
+
+        if read_thread.is_alive():
+            # Thread is still running - file access is hanging (likely cloud-only)
+            logger.warning(
+                f"File access timed out after {timeout_seconds}s - "
+                f"file may be cloud-only: {file_path}"
+            )
+            return False
+
+        if not result["accessible"]:
+            logger.warning(f"File not accessible: {file_path} - {result['error']}")
+            return False
+
+        return True
+
     def has_ocr_conversion(self, item_key: str) -> bool:
         """
         Check if an item already has an OCR-converted markdown.
@@ -256,6 +319,16 @@ class ZoteroOCRIntegration:
             if local_path:
                 pdf_source_path = Path(local_path)
                 if pdf_source_path.exists():
+                    # Check if file is actually accessible (not a cloud-only placeholder)
+                    if not self._is_file_accessible(pdf_source_path):
+                        error_msg = (
+                            f"File is not available locally: {pdf_source_path}. "
+                            f"This file may be stored in the cloud (OneDrive/Dropbox/etc.) "
+                            f"but not synced to this computer. Please ensure the file is "
+                            f"downloaded locally before processing."
+                        )
+                        logger.error(error_msg)
+                        raise FileNotAccessibleError(error_msg)
                     logger.info(f"Using linked file directly: {pdf_source_path}")
                     return self._process_pdf_file(pdf_source_path, item_key, store_in_zotero, filename)
                 else:

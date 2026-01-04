@@ -12,7 +12,7 @@ from mistral_ocr_zotero.converter import (
     OCRCache,
 )
 from mistral_ocr_zotero.zotero_storage import ZoteroOCRStorage, OCR_ATTACHMENT_MARKER
-from mistral_ocr_zotero.zotero_integration import ZoteroOCRIntegration
+from mistral_ocr_zotero.zotero_integration import ZoteroOCRIntegration, FileNotAccessibleError
 
 __version__ = "0.1.0"
 __all__ = [
@@ -28,4 +28,6 @@ __all__ = [
     "ZoteroOCRStorage",
     "ZoteroOCRIntegration",
     "OCR_ATTACHMENT_MARKER",
+    # Exceptions
+    "FileNotAccessibleError",
 ]
