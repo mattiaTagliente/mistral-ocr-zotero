@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,8 @@ from pyzotero import zotero
 from mistral_ocr_zotero.converter import convert_to_markdown_enhanced, ConversionResult
 from mistral_ocr_zotero.ocr_client import MistralOCRClient, OCRResult
 from mistral_ocr_zotero.zotero_storage import ZoteroOCRStorage, OCR_ATTACHMENT_MARKER
+from mistral_ocr_zotero.pdf_chunker import PDFChunker, MAX_PAGES_PER_CHUNK
+from mistral_ocr_zotero.chunk_merger import ChunkMerger, ChunkOCRResult
 
 logger = logging.getLogger(__name__)
 
@@ -27,10 +30,28 @@ logger = logging.getLogger(__name__)
 class FileNotAccessibleError(Exception):
     """
     Raised when a file exists but is not accessible.
-    
+
     This commonly occurs with cloud sync services (OneDrive, Dropbox, etc.)
     where files appear to exist locally but are actually cloud-only placeholders
     that haven't been synced.
+    """
+    pass
+
+
+class OCRProcessingError(Exception):
+    """
+    Raised when Mistral OCR processing fails.
+
+    This includes API errors, page limit exceeded, invalid documents, etc.
+    """
+    pass
+
+
+class PDFDownloadError(Exception):
+    """
+    Raised when PDF download or access fails.
+
+    This includes Zotero API errors, missing files, or network issues.
     """
     pass
 
@@ -118,32 +139,132 @@ class ZoteroOCRIntegration:
         item_key: str,
         store_in_zotero: bool = True,
         original_filename: str | None = None,
-    ) -> OCRResult | None:
+    ) -> OCRResult:
         """
         Process a PDF file through Mistral OCR.
 
+        Handles large PDFs by automatically chunking at semantic boundaries
+        (chapter/section breaks from TOC) when they exceed the API limit.
+
         Args:
-            pdf_path: Path to the PDF file.
+            pdf_path: path to the PDF file.
             item_key: Zotero item key for storage.
-            store_in_zotero: Whether to store the result in Zotero.
-            original_filename: Original filename for storage reference.
+            store_in_zotero: whether to store the result in Zotero.
+            original_filename: original filename for storage reference.
 
         Returns:
-            OCRResult if successful, None otherwise.
+            OCRResult with processed content.
+
+        Raises:
+            OCRProcessingError: if OCR processing fails.
         """
         if self.ocr is None:
-            logger.error("OCR client not initialized")
-            return None
+            raise OCRProcessingError("OCR client not initialized (missing Mistral API key?)")
 
         try:
-            result = self.ocr.process_pdf_from_path(pdf_path)
-            logger.info(
-                f"OCR complete: {result.pages_processed} pages, "
-                f"{len(result.images)} images extracted"
-            )
+            # Analyze PDF for chunking
+            chunker = PDFChunker()
+            analysis = chunker.analyze(pdf_path)
+
+            if not analysis.needs_chunking:
+                # Standard processing for small documents
+                result = self.ocr.process_pdf_from_path(pdf_path)
+                logger.info(
+                    f"OCR complete: {result.pages_processed} pages, "
+                    f"{len(result.images)} images extracted"
+                )
+            else:
+                # Large document - process in chunks
+                logger.info(
+                    f"Large PDF detected ({analysis.total_pages} pages), "
+                    f"splitting into {len(analysis.chunks)} chunks "
+                    f"(TOC {'used' if analysis.has_toc else 'not available, using fixed splits'})"
+                )
+
+                # Check for saved chunk progress
+                saved_indices = self.storage.get_saved_chunk_indices(item_key)
+                if saved_indices:
+                    logger.info(
+                        f"Found {len(saved_indices)} saved chunks for item {item_key}, "
+                        f"resuming from chunk {max(saved_indices) + 1}"
+                    )
+
+                # Extract chunk PDFs to temp directory
+                with tempfile.TemporaryDirectory(prefix="ocr_chunks_") as chunk_dir:
+                    chunks = chunker.extract_chunks(
+                        pdf_path,
+                        analysis.chunks,
+                        output_dir=Path(chunk_dir),
+                    )
+
+                    # Process each chunk with delay between to avoid rate limiting
+                    chunk_results: list[ChunkOCRResult] = []
+                    for i, chunk in enumerate(chunks):
+                        # Check if this chunk was already processed
+                        saved = self.storage.load_chunk_result(item_key, chunk.chunk_index)
+                        if saved is not None:
+                            saved_result, saved_info = saved
+                            logger.info(
+                                f"Loading saved chunk {chunk.chunk_index + 1}/{len(chunks)}: "
+                                f"pages {saved_info['start_page'] + 1}-{saved_info['end_page']}"
+                            )
+                            chunk_results.append(
+                                ChunkOCRResult(
+                                    chunk=chunk,
+                                    result=saved_result,
+                                )
+                            )
+                            continue
+
+                        # Process this chunk
+                        logger.info(
+                            f"Processing chunk {chunk.chunk_index + 1}/{len(chunks)}: "
+                            f"pages {chunk.start_page + 1}-{chunk.end_page}"
+                            + (f" ({chunk.title})" if chunk.title else "")
+                        )
+                        chunk_result = self.ocr.process_pdf_from_path(chunk.chunk_path)
+                        chunk_results.append(
+                            ChunkOCRResult(
+                                chunk=chunk,
+                                result=chunk_result,
+                            )
+                        )
+
+                        # Save progress immediately after successful processing
+                        self.storage.save_chunk_result(
+                            item_key,
+                            chunk.chunk_index,
+                            chunk_result,
+                            {
+                                "start_page": chunk.start_page,
+                                "end_page": chunk.end_page,
+                                "title": chunk.title,
+                            },
+                        )
+
+                        # Add delay between chunks to avoid rate limiting
+                        if i < len(chunks) - 1:
+                            time.sleep(2)
+
+                    # Merge results
+                    merger = ChunkMerger()
+                    result = merger.merge(
+                        chunk_results,
+                        source_file=original_filename or pdf_path.name,
+                    )
+
+                    # Clear chunk progress after successful merge
+                    self.storage.clear_chunk_results(item_key)
+
+                logger.info(
+                    f"OCR complete: {result.pages_processed} pages from "
+                    f"{len(chunks)} chunks, {len(result.images)} images"
+                )
+
         except Exception as e:
-            logger.error(f"OCR processing failed: {e}")
-            return None
+            error_msg = f"OCR processing failed: {e}"
+            logger.error(error_msg)
+            raise OCRProcessingError(error_msg) from e
 
         # Store result
         if store_in_zotero:
@@ -198,11 +319,17 @@ class ZoteroOCRIntegration:
 
         Args:
             item_key: Zotero item key.
-            force: Force reprocessing even if conversion exists.
-            store_in_zotero: Store the result as a Zotero attachment.
+            force: force reprocessing even if conversion exists.
+            store_in_zotero: store the result as a Zotero attachment.
 
         Returns:
-            OCRResult if processing occurred, None if skipped.
+            OCRResult if processing occurred, None if legitimately skipped
+            (already processed or no PDF attachment).
+
+        Raises:
+            OCRProcessingError: if OCR processing fails.
+            PDFDownloadError: if PDF download or access fails.
+            FileNotAccessibleError: if file exists but cannot be read.
         """
         # Check for existing conversion
         if not force and self.has_ocr_conversion(item_key):
@@ -216,16 +343,16 @@ class ZoteroOCRIntegration:
             return None
 
         attachment_key = pdf_attachment.get("key")
-        
+
         # Try to get a meaningful filename from multiple sources
         data = pdf_attachment.get("data", {})
         filename = data.get("filename") or data.get("title")
-        
+
         # Debug logging for filename detection
         logger.debug(f"PDF attachment data keys: {list(data.keys())}")
         logger.debug(f"PDF attachment filename from data: {data.get('filename')}")
         logger.debug(f"PDF attachment title from data: {data.get('title')}")
-        
+
         # If still no filename, try to get parent item info for a meaningful name
         if not filename or filename == "document.pdf":
             try:
@@ -234,14 +361,15 @@ class ZoteroOCRIntegration:
                 # Use citation key if available, otherwise title
                 citation_key = parent_data.get("citationKey")
                 title = parent_data.get("title", "")
-                
+
                 if citation_key:
                     filename = f"{citation_key}.pdf"
                     logger.info(f"Using citation key for filename: {filename}")
                 elif title:
                     # Clean title for use as filename
                     import re
-                    clean_title = re.sub(r'[<>:"/\\|?*]', '', title)[:80]
+
+                    clean_title = re.sub(r'[<>:"/\\|?*]', "", title)[:80]
                     filename = f"{clean_title}.pdf"
                     logger.info(f"Using cleaned title for filename: {filename}")
                 else:
@@ -255,7 +383,7 @@ class ZoteroOCRIntegration:
         # Check if this is a linked file (path stored locally) vs imported file
         link_mode = data.get("linkMode", "")
         local_path = data.get("path", "")
-        
+
         # For linked files, read directly from disk
         if link_mode == "linked_file" and local_path:
             # Clean up the path (Zotero stores it with possible prefix)
@@ -263,7 +391,7 @@ class ZoteroOCRIntegration:
                 # Relative to Zotero attachments base dir - need to resolve
                 logger.warning(f"Relative attachment path not supported: {local_path}")
                 local_path = ""
-            
+
             if local_path:
                 pdf_source_path = Path(local_path)
                 if pdf_source_path.exists():
@@ -271,7 +399,9 @@ class ZoteroOCRIntegration:
                     # will sync on-demand when the file is accessed
                     logger.info(f"Using linked file directly: {pdf_source_path}")
                     try:
-                        return self._process_pdf_file(pdf_source_path, item_key, store_in_zotero, filename)
+                        return self._process_pdf_file(
+                            pdf_source_path, item_key, store_in_zotero, filename
+                        )
                     except OSError as e:
                         # File access error - could be cloud sync failure, permissions, etc.
                         error_msg = (
@@ -283,8 +413,9 @@ class ZoteroOCRIntegration:
                         logger.error(error_msg)
                         raise FileNotAccessibleError(error_msg) from e
                 else:
-                    logger.error(f"Linked file not found: {pdf_source_path}")
-                    return None
+                    error_msg = f"Linked file not found: {pdf_source_path}"
+                    logger.error(error_msg)
+                    raise PDFDownloadError(error_msg)
 
         # For imported files or if linked file path didn't work, use dump()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -292,12 +423,14 @@ class ZoteroOCRIntegration:
             try:
                 self.zot.dump(attachment_key, path=tmpdir, filename=filename)
             except Exception as e:
-                logger.error(f"Failed to download PDF: {e}")
-                return None
+                error_msg = f"Failed to download PDF from Zotero: {e}"
+                logger.error(error_msg)
+                raise PDFDownloadError(error_msg) from e
 
             if not pdf_path.exists():
-                logger.error(f"PDF download failed, file not found: {pdf_path}")
-                return None
+                error_msg = f"PDF download failed, file not found after download: {pdf_path}"
+                logger.error(error_msg)
+                raise PDFDownloadError(error_msg)
 
             return self._process_pdf_file(pdf_path, item_key, store_in_zotero, filename)
 

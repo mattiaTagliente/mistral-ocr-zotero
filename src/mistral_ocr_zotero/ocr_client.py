@@ -5,13 +5,21 @@ Mistral OCR API client for PDF-to-markdown conversion.
 from __future__ import annotations
 
 import base64
+import logging
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mistralai import Mistral
 from mistralai.models import DocumentURLChunk
+
+logger = logging.getLogger(__name__)
+
+# Retry configuration for transient API errors
+MAX_RETRIES = 5
+RETRY_DELAY_SECONDS = 10
 
 if TYPE_CHECKING:
     from mistralai.models import OCRResponse
@@ -91,20 +99,39 @@ class MistralOCRClient:
             purpose="ocr",
         )
 
-        # Get signed URL for processing
-        signed_url = self.client.files.get_signed_url(
-            file_id=uploaded_file.id, expiry=1
-        )
+        # Process with OCR (with retry for transient errors)
+        last_error: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                # Get fresh signed URL for each attempt (URLs expire after 1 minute)
+                signed_url = self.client.files.get_signed_url(
+                    file_id=uploaded_file.id, expiry=1
+                )
+                response = self.client.ocr.process(
+                    document=DocumentURLChunk(document_url=signed_url.url),
+                    model=self.model,
+                    include_image_base64=include_images,
+                    table_format=table_format,  # type: ignore[arg-type]
+                )
+                return self._parse_response(response, source_file=pdf_path.name)
+            except Exception as e:
+                last_error = e
+                error_str = str(e)
+                # Retry on 500/503 errors (transient server issues)
+                if "500" in error_str or "503" in error_str or "Service unavailable" in error_str:
+                    if attempt < MAX_RETRIES - 1:
+                        wait_time = RETRY_DELAY_SECONDS * (attempt + 1)
+                        logger.warning(
+                            f"OCR request failed with transient error (attempt {attempt + 1}/{MAX_RETRIES}), "
+                            f"retrying in {wait_time}s: {e}"
+                        )
+                        time.sleep(wait_time)
+                        continue
+                # Non-retryable error, raise immediately
+                raise
 
-        # Process with OCR
-        response = self.client.ocr.process(
-            document=DocumentURLChunk(document_url=signed_url.url),
-            model=self.model,
-            include_image_base64=include_images,
-            table_format=table_format,  # type: ignore[arg-type]
-        )
-
-        return self._parse_response(response, source_file=pdf_path.name)
+        # All retries exhausted
+        raise last_error  # type: ignore[misc]
 
     def process_pdf_from_url(
         self,

@@ -35,6 +35,22 @@ MistralOCR_Zotero integrates the Mistral OCR API with Zotero-MCP to convert PDF 
   - `ZoteroOCRIntegration`: Complete workflow for processing Zotero items
   - Supports `local=True` mode for faster PDF access via local Zotero API
   - `get_fulltext_with_ocr()`: Enhanced replacement for zotero-mcp get_fulltext
+  - Custom exceptions: `OCRProcessingError`, `PDFDownloadError`, `FileNotAccessibleError`
+
+- `src/mistral_ocr_zotero/pdf_chunker.py` - Large PDF partitioning
+  - `PDFChunker`: analyzes PDFs and determines chunk boundaries
+  - `TOCEntry`: represents a table of contents entry (level, title, page)
+  - `PDFChunk`: defines a chunk (chunk_index, start_page, end_page, title)
+  - `ChunkingResult`: analysis result (total_pages, chunks, has_toc, needs_chunking)
+  - Uses PyMuPDF (pymupdf) for TOC extraction and PDF manipulation
+  - Constants: `MAX_PAGES_PER_CHUNK = 500`, `DEFAULT_CHUNK_SIZE = 450`
+
+- `src/mistral_ocr_zotero/chunk_merger.py` - Chunk result reconstruction
+  - `ChunkMerger`: merges OCR results from multiple chunks into unified output
+  - `ChunkOCRResult`: pairs a PDFChunk with its OCRResult
+  - Handles page renumbering (`<!-- Page N -->` markers adjusted for continuity)
+  - Prefixes image/table names (`chunk00_img-001.jpeg`) to avoid collisions
+  - Adds provenance markers (`<!-- Chunk 1 of 3 (pages 1-950) -->`)
 
 - `src/mistral_ocr_zotero/server.py` - HTTP server for Zotero plugin
   - FastAPI server on `localhost:8080`
@@ -51,10 +67,43 @@ MistralOCR_Zotero integrates the Mistral OCR API with Zotero-MCP to convert PDF 
    - Return markdown content to caller
 2. Fallback to markitdown/standard extraction if Mistral API is unavailable
 
+### Large PDF Handling (Semantic Chunking)
+
+The Mistral OCR API has a 500-page limit per document. For larger PDFs, the system automatically partitions them at semantic boundaries (chapters/sections), processes each chunk separately, and reconstructs a unified markdown output.
+
+**Chunking Strategy**:
+1. `PDFChunker.analyze()` checks if PDF exceeds `MAX_PAGES_PER_CHUNK` (500 pages)
+2. If TOC exists, chunks are split at the last chapter/section boundary before each 500-page limit
+3. If no TOC, falls back to fixed-size chunks of `DEFAULT_CHUNK_SIZE` (950 pages)
+4. Each chunk is extracted to a temporary PDF file via PyMuPDF's `insert_pdf()`
+
+**Merge Strategy**:
+1. Each chunk is processed independently through Mistral OCR
+2. `ChunkMerger.merge()` combines results:
+   - Page markers (`<!-- Page N -->`) are renumbered for continuity across chunks
+   - Image names are prefixed (`chunk00_img-001.jpeg`, `chunk01_img-001.jpeg`) to avoid collisions
+   - Table IDs are similarly prefixed
+   - Provenance markers are added to track chunk boundaries
+
+**Example**: A 1824-page PDF (like Sedra's Microelectronic Circuits) is split into:
+- Chunk 0: pages 1-950 (or nearest chapter boundary)
+- Chunk 1: pages 951-1824 (or appropriate boundaries)
+
+### Exception Handling
+
+The integration layer uses specific exceptions for proper error propagation:
+
+- `OCRProcessingError`: Mistral OCR API failures (page limit exceeded, API errors, invalid PDF)
+- `PDFDownloadError`: PDF download or access failures
+- `FileNotAccessibleError`: Local file system access failures
+
+The server catches these exceptions and returns the actual error message to the Zotero plugin, instead of the generic "Already processed or no PDF" message.
+
 ### Key Integration Points
 
 - **Mistral OCR API**: `mistral-ocr-latest` model via `mistralai` SDK
 - **Zotero API**: Via `pyzotero` library for item/attachment management
+- **PyMuPDF (pymupdf)**: PDF analysis and chunking for large documents
 - **markitdown**: Fallback PDF-to-markdown converter
 - **Zotero-MCP**: Target integration point - replace `convert_to_markdown` in `client.py`
 
@@ -118,7 +167,7 @@ Updated `convert_to_markdown()` to use Mistral OCR with markitdown fallback.
 
 ```bash
 # Install into zotero-mcp environment
-uv pip install -e "C:\Users\matti\OneDrivePhD\Dev\MistralOCR_Zotero" \
+uv pip install -e "C:\Users\matti\Dev\MistralOCR_Zotero" \
   --python "C:\Users\matti\AppData\Roaming\uv\tools\zotero-mcp\Scripts\python.exe"
 ```
 
@@ -128,7 +177,7 @@ After installation, restart Claude Code for the MCP server to reload.
 
 A separate Zotero plugin (`zotero-mistral-ocr`) provides a right-click context menu to trigger OCR processing directly from the Zotero UI.
 
-**Plugin Repository**: `C:\Users\matti\OneDrivePhD\Dev\zotero-mistral-ocr`
+**Plugin Repository**: `C:\Users\matti\Dev\zotero-mistral-ocr`
 
 ### Architecture
 
@@ -281,4 +330,6 @@ See `docs/mistral_ocr_api.md` for complete Mistral OCR API documentation includi
 - Endpoint specifications and parameters
 - Python SDK usage patterns
 - Response structure and parsing
-- Pricing ($1/1000 pages) and limits (50MB max, 1000 pages max)
+- Pricing ($1/1000 pages) and limits (50MB max, 500 pages max per call)
+
+**Note**: The 500-page limit is per API call. Large PDFs are automatically chunked into multiple calls (see "Large PDF Handling" section above).

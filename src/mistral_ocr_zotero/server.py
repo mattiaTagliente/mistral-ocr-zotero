@@ -37,7 +37,12 @@ except ImportError:
     print("FastAPI and uvicorn are required. Install with: pip install fastapi uvicorn")
     sys.exit(1)
 
-from mistral_ocr_zotero.zotero_integration import ZoteroOCRIntegration
+from mistral_ocr_zotero.zotero_integration import (
+    ZoteroOCRIntegration,
+    OCRProcessingError,
+    PDFDownloadError,
+    FileNotAccessibleError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -152,21 +157,29 @@ async def process_items_background(job_id: str, item_keys: list[str], force: boo
                         "item_key": item_key,
                         "pages": result.pages_processed,
                         "images": len(result.images),
-                        "tables": len(getattr(result, 'tables', {})),
+                        "tables": len(getattr(result, "tables", {})),
                     })
                     logger.info(f"Completed {item_key}: {result.pages_processed} pages")
                 else:
+                    # Legitimate skip - item already processed or has no PDF attachment
                     job.results.append({
                         "item_key": item_key,
                         "skipped": True,
-                        "reason": "Already processed or no PDF",
+                        "reason": "Already processed or no PDF attachment",
                     })
-                    logger.info(f"Skipped {item_key}")
+                    logger.info(f"Skipped {item_key}: already processed or no PDF")
 
-            except Exception as e:
+            except (OCRProcessingError, PDFDownloadError, FileNotAccessibleError) as e:
+                # Known error types - report with specific message
                 error_msg = str(e)
                 job.errors.append({"item_key": item_key, "error": error_msg})
                 logger.error(f"Error processing {item_key}: {error_msg}")
+
+            except Exception as e:
+                # Unexpected errors
+                error_msg = f"Unexpected error: {e}"
+                job.errors.append({"item_key": item_key, "error": error_msg})
+                logger.error(f"Unexpected error processing {item_key}: {e}")
 
             job.completed = i + 1
 

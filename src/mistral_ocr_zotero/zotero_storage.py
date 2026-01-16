@@ -637,3 +637,131 @@ Converted: {datetime.now().isoformat()}
         text = re.sub(r'<[^>]+>', '', text)  # Remove remaining tags
 
         return text.strip()
+
+    # ========== Chunk Progress Storage ==========
+
+    def get_chunks_dir(self, item_key: str) -> Path:
+        """Get the directory for storing chunk progress."""
+        return self.storage_dir / item_key / "chunks"
+
+    def save_chunk_result(
+        self,
+        item_key: str,
+        chunk_index: int,
+        result: OCRResult,
+        chunk_info: dict[str, Any],
+    ) -> None:
+        """
+        Save a single chunk's OCR result for later resumption.
+
+        Args:
+            item_key: Zotero item key.
+            chunk_index: Index of the chunk (0-based).
+            result: OCR result for this chunk.
+            chunk_info: Chunk metadata (start_page, end_page, title).
+        """
+        chunks_dir = self.get_chunks_dir(item_key)
+        chunks_dir.mkdir(parents=True, exist_ok=True)
+
+        chunk_data = {
+            "chunk_index": chunk_index,
+            "chunk_info": chunk_info,
+            "markdown": result.markdown,
+            "pages_processed": result.pages_processed,
+            "source_file": result.source_file,
+            "tables": result.tables,
+            "saved_at": datetime.now().isoformat(),
+        }
+
+        # Save images separately (binary data)
+        if result.images:
+            images_dir = chunks_dir / f"chunk_{chunk_index:03d}_images"
+            images_dir.mkdir(exist_ok=True)
+            chunk_data["images_dir"] = str(images_dir)
+            for filename, data in result.images.items():
+                (images_dir / filename).write_bytes(data)
+
+        # Save chunk metadata
+        chunk_file = chunks_dir / f"chunk_{chunk_index:03d}.json"
+        with open(chunk_file, "w", encoding="utf-8") as f:
+            json.dump(chunk_data, f, indent=2)
+
+        logger.info(f"Saved chunk {chunk_index} progress for item {item_key}")
+
+    def load_chunk_result(
+        self,
+        item_key: str,
+        chunk_index: int,
+    ) -> tuple[OCRResult, dict[str, Any]] | None:
+        """
+        Load a saved chunk's OCR result.
+
+        Args:
+            item_key: Zotero item key.
+            chunk_index: Index of the chunk (0-based).
+
+        Returns:
+            Tuple of (OCRResult, chunk_info) if saved, None otherwise.
+        """
+        chunk_file = self.get_chunks_dir(item_key) / f"chunk_{chunk_index:03d}.json"
+        if not chunk_file.exists():
+            return None
+
+        with open(chunk_file, "r", encoding="utf-8") as f:
+            chunk_data = json.load(f)
+
+        # Load images if present
+        images: dict[str, bytes] = {}
+        if "images_dir" in chunk_data:
+            images_dir = Path(chunk_data["images_dir"])
+            if images_dir.exists():
+                for img_file in images_dir.iterdir():
+                    images[img_file.name] = img_file.read_bytes()
+
+        result = OCRResult(
+            markdown=chunk_data["markdown"],
+            images=images,
+            pages_processed=chunk_data["pages_processed"],
+            source_file=chunk_data.get("source_file"),
+            tables=chunk_data.get("tables", {}),
+        )
+
+        return result, chunk_data["chunk_info"]
+
+    def get_saved_chunk_indices(self, item_key: str) -> list[int]:
+        """
+        Get list of chunk indices that have been saved.
+
+        Args:
+            item_key: Zotero item key.
+
+        Returns:
+            List of saved chunk indices (sorted).
+        """
+        chunks_dir = self.get_chunks_dir(item_key)
+        if not chunks_dir.exists():
+            return []
+
+        indices = []
+        for chunk_file in chunks_dir.glob("chunk_*.json"):
+            # Extract index from filename like "chunk_003.json"
+            try:
+                index = int(chunk_file.stem.split("_")[1])
+                indices.append(index)
+            except (IndexError, ValueError):
+                continue
+
+        return sorted(indices)
+
+    def clear_chunk_results(self, item_key: str) -> None:
+        """
+        Clear all saved chunk progress after successful completion.
+
+        Args:
+            item_key: Zotero item key.
+        """
+        chunks_dir = self.get_chunks_dir(item_key)
+        if chunks_dir.exists():
+            import shutil
+            shutil.rmtree(chunks_dir)
+            logger.info(f"Cleared chunk progress for item {item_key}")
